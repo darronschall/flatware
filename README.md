@@ -138,7 +138,12 @@ Now when I run `bundle exec flatware rspec -r ./spec/flatware_helper` My app onl
 
 ## SimpleCov
 
-If you're using SimpleCov, follow [their directions](https://github.com/simplecov-ruby/simplecov/tree/main?tab=readme-ov-file#use-it-with-any-framework) to install. When you have it working as desired for serial runs, add `SimpleCov.at_fork.call(test_env_number)` to flatware's `after_fork` hook. You should now get the same coverage stats from parallel and serial runs.
+If you're using SimpleCov, follow [their directions](https://github.com/simplecov-ruby/simplecov/tree/main?tab=readme-ov-file#use-it-with-any-framework) to install. Each worker has to re-arm coverage after the fork so its slice gets written and merged, and flatware's `after_fork` hook is where that happens — but whether you have to do it by hand depends on your SimpleCov version and configuration:
+
+- **SimpleCov 1.0+ with subprocess merging enabled** hooks `Process._fork` itself and calls `SimpleCov.at_fork` in the child for you. `SimpleCov.start "rails"` enables it, as does setting `SimpleCov.merge_subprocesses true`. Don't call `at_fork` again here: the default `at_fork` names each slice by appending its ordinal to the current `command_name`, so a second call produces `RSpec (subprocess: 1) (subprocess: 1)` for every worker in the merged report.
+- **Anything else** needs `SimpleCov.at_fork.call(test_env_number)` in `after_fork` yourself. That covers a bare `SimpleCov.start`, which enables no subprocess merging and so installs no hook, and SimpleCov 0.22, which hooks `Process.fork` by alias — flatware forks with a bare `Kernel#fork`, which bypasses that but does route through `Process._fork`.
+
+`SimpleCov.enabled_for_subprocesses?` tells you which case you're in. Either way you should now get the same coverage stats from parallel and serial runs.
 
 ### Avoiding the parent / worker merge race
 
@@ -167,7 +172,7 @@ Flatware.configure do |conf|
     # `Process.pid != parent_pid` short-circuit no-ops it in
     # every child.
     parent_pid = Process.pid
-     at_exit do
+    at_exit do
       next if Process.pid != parent_pid
 
       begin
@@ -179,14 +184,21 @@ Flatware.configure do |conf|
   end
 
   conf.after_fork do |test_env_number|
-    SimpleCov.at_fork.call(test_env_number)
+    # Uncomment only if SimpleCov isn't hooking fork itself (see
+    # above). This example loads a Rails app, which typically
+    # means `SimpleCov.start "rails"` — that enables subprocess
+    # merging, so at_fork has already run in this child and a
+    # second call would double every slice's name.
+    # SimpleCov.at_fork.call(test_env_number)
 
-    # If you use SimpleCov.minimum_coverage_by_file in CI, also
-    # clear it inside the worker — SimpleCov.at_fork's default
-    # lambda clears the aggregate `minimum_coverage` but not the
-    # per-file one, so workers will otherwise kill themselves on
-    # the per-file 100% check before their slice can merge:
-    # SimpleCov.minimum_coverage_by_file 0
+    # If you gate CI on a per-file threshold, clear it inside the
+    # worker — at_fork's default lambda clears the aggregate
+    # `minimum_coverage` but not the per-file one, so workers will
+    # otherwise kill themselves on the per-file % check before
+    # their slice can merge. The parent's at_exit still enforces
+    # both against the merged report.
+    SimpleCov.coverage(:line) { minimum_per_file 0 } # 1.0+
+    # SimpleCov.minimum_coverage_by_file 0           # 0.22
   end
 end
 ```
